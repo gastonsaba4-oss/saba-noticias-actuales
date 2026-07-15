@@ -15,16 +15,11 @@ export async function middleware(req: NextRequest) {
         },
         remove: (name: string, options: any) => {
           res.cookies.set({ name, value: "", ...options });
-         },
-        remove: (name, options) => {
-          res.cookies.set({ name, value: "", ...options });
         },
       },
     }
   );
 
-  // Refresca el token si está por expirar, para que la sesión no se
-  // corte mientras el usuario navega el dashboard.
   await supabase.auth.getSession();
 
   return res;
