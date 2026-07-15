@@ -1,8 +1,32 @@
-import Anthropic from "@anthropic-ai/sdk";
 import crypto from "crypto";
 import type { RawNewsItem, ProcessedNewsItem, Category, Importance, EconomicImpact } from "@/lib/types";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+async function callGemini(systemPrompt: string, userContent: string): Promise<string> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: "user", parts: [{ text: userContent }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.4,
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini API error ${res.status}: ${errText}`);
+  }
+
+  const data = await res.json();
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+}
 
 const CATEGORIES: Category[] = [
   "Argentina", "Economía", "Política", "Sociedad", "Tecnología",
@@ -10,12 +34,6 @@ const CATEGORIES: Category[] = [
   "Mercados", "Dólar", "Criptomonedas", "Clima", "Partido de la Costa",
 ];
 
-/**
- * Paso 1 — Preagrupado barato (sin llamar a la IA):
- * agrupa titulares muy similares por superposición de palabras clave,
- * para no pagarle a la IA por comparar cada noticia contra todas.
- * La IA hace la deduplicación fina dentro de cada grupo en el paso 2.
- */
 function keywordCluster(items: RawNewsItem[]): RawNewsItem[][] {
   const stopwords = new Set(["de", "la", "el", "en", "y", "a", "los", "las", "un", "una", "por", "que", "con", "para", "del"]);
   const sig = (title: string) =>
@@ -76,22 +94,12 @@ async function enrichCluster(cluster: RawNewsItem[]): Promise<AiEnrichment> {
     publishedAt: c.publishedAt,
   }));
 
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 1000,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: JSON.stringify(articlesForPrompt) }],
-  });
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  const raw = textBlock && "text" in textBlock ? textBlock.text : "{}";
+  const raw = await callGemini(SYSTEM_PROMPT, JSON.stringify(articlesForPrompt));
   const cleaned = raw.replace(/```json|```/g, "").trim();
 
   try {
     return JSON.parse(cleaned) as AiEnrichment;
   } catch {
-    // Fallback conservador si la IA devolvió algo no parseable:
-    // no rompemos el pipeline, degradamos a un resumen mínimo.
     return {
       category: "Argentina",
       importance: "Baja",
@@ -118,15 +126,6 @@ function toArgentinaTime(iso: string): string {
   });
 }
 
-/**
- * Pipeline completo: agrupa por similitud, le pide a la IA que
- * deduplique/resuma/clasifique cada grupo, y devuelve la lista lista
- * para el frontend, ordenada por importancia y horario.
- *
- * Nota de costos: procesa clusters en paralelo con Promise.all pero en
- * producción real conviene limitar la concurrencia (ej. p-limit) para
- * no saturar el rate limit de la API.
- */
 export async function processNews(rawItems: RawNewsItem[]): Promise<ProcessedNewsItem[]> {
   const clusters = keywordCluster(rawItems);
 
@@ -168,30 +167,22 @@ export async function processNews(rawItems: RawNewsItem[]): Promise<ProcessedNew
   });
 }
 
-/** Genera el panel de "Resumen Diario" a partir de las noticias ya procesadas de hoy y de ayer. */
 export async function generateDailyDigest(
   today: ProcessedNewsItem[],
   yesterdayTopTitles: string[]
 ) {
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 600,
-    system: `Devolvé SOLO un JSON con esta forma, sin texto adicional:
+  const systemPrompt = `Devolvé SOLO un JSON con esta forma, sin texto adicional:
 { "whatChanged": string (2-3 líneas), "dominantTopics": string (1-2 líneas) }
-Basate en las noticias de hoy comparadas contra los titulares principales de ayer.`,
-    messages: [
-      {
-        role: "user",
-        content: JSON.stringify({
-          hoy: today.slice(0, 15).map((n) => n.title),
-          ayer: yesterdayTopTitles,
-        }),
-      },
-    ],
-  });
+Basate en las noticias de hoy comparadas contra los titulares principales de ayer.`;
 
-  const textBlock = response.content.find((b) => b.type === "text");
-  const raw = textBlock && "text" in textBlock ? textBlock.text : "{}";
+  const raw = await callGemini(
+    systemPrompt,
+    JSON.stringify({
+      hoy: today.slice(0, 15).map((n) => n.title),
+      ayer: yesterdayTopTitles,
+    })
+  );
+
   try {
     const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
     return {
